@@ -43,6 +43,8 @@ except ImportError:
     Intents = Any
     commands = None
 
+from .terminal_filter import classify_bot_message, is_terminal_bot_message
+
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
@@ -790,6 +792,26 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
+
+                    # Terminal-chatter suppression (issue #172): a bot permitted
+                    # by DISCORD_ALLOW_BOTS may still be posting explicit
+                    # terminal/control chatter (ack/final/status/no-op/
+                    # standing-down/no-further-action/closed). Dispatching it
+                    # wakes the peer agent, which acks back — a reciprocal-ACK
+                    # loop. Drop terminal kinds before _handle_message.
+                    # Keys ONLY on an explicit `kind:` protocol marker; prose
+                    # fails safe toward route so a real request is never
+                    # dropped (the #174 lesson). Guard is bot-only — the
+                    # non-bot else branch below is untouched, so human terminal
+                    # chatter always routes.
+                    if is_terminal_bot_message(message.content):
+                        logger.debug(
+                            "[%s] Suppressing terminal bot chatter from %s (kind=%s)",
+                            self.name,
+                            getattr(message.author, "name", "?"),
+                            classify_bot_message(message.content),
+                        )
+                        return
                 else:
                     # Non-bot: enforce the configured user/role allowlists.
                     # Pass guild + is_dm so role checks are scoped to the
