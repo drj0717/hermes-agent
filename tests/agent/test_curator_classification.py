@@ -362,6 +362,75 @@ def test_report_md_splits_consolidated_and_pruned_sections(curator_env):
     assert "### Skills archived" not in md
 
 
+def test_write_run_report_records_declared_deletes_not_archived_this_run(curator_env):
+    """Delete declarations for skills absent from the before snapshot are reported separately.
+
+    A real curator run can include a `skill_manage(delete, absorbed_into=...)`
+    call for a skill that is already archived or otherwise absent from the
+    before/after active-skill snapshots. That call should not inflate
+    `archived_this_run`, but the report should preserve the evidence so the
+    LLM final summary and machine counts are explainable.
+    """
+    curator = curator_env
+    start = datetime.now(timezone.utc)
+    before = [
+        {"name": "removed-skill", "state": "active", "pinned": False},
+        {"name": "umbrella", "state": "active", "pinned": False},
+    ]
+    after = [{"name": "umbrella", "state": "active", "pinned": False}]
+
+    run_dir = curator._write_run_report(
+        started_at=start,
+        elapsed_seconds=10.0,
+        auto_counts={"checked": 2, "marked_stale": 0, "archived": 0, "reactivated": 0},
+        auto_summary="no auto changes",
+        before_report=before,
+        before_names={r["name"] for r in before},
+        after_report=after,
+        llm_meta={
+            "final": "Consolidated removed-skill and already-archived-skill into umbrella.",
+            "summary": "2 consolidated",
+            "model": "m",
+            "provider": "p",
+            "error": None,
+            "tool_calls": [
+                {
+                    "name": "skill_manage",
+                    "arguments": json.dumps({
+                        "action": "delete",
+                        "name": "removed-skill",
+                        "absorbed_into": "umbrella",
+                    }),
+                },
+                {
+                    "name": "skill_manage",
+                    "arguments": json.dumps({
+                        "action": "delete",
+                        "name": "already-archived-skill",
+                        "absorbed_into": "umbrella",
+                    }),
+                },
+            ],
+        },
+    )
+
+    payload = json.loads((run_dir / "run.json").read_text())
+    assert payload["counts"]["archived_this_run"] == 1
+    assert payload["counts"]["consolidated_this_run"] == 1
+    assert payload["counts"]["delete_declarations_not_archived"] == 1
+    assert payload["delete_declarations_not_archived"] == [
+        {
+            "name": "already-archived-skill",
+            "into": "umbrella",
+            "source": "absorbed_into declaration for non-archived skill",
+        }
+    ]
+
+    md = (run_dir / "REPORT.md").read_text()
+    assert "Delete declarations not archived this run (1)" in md
+    assert "`already-archived-skill` → declared absorbed into `umbrella`" in md
+
+
 # ---------------------------------------------------------------------------
 # _parse_structured_summary — extracting the model's required YAML block
 # ---------------------------------------------------------------------------

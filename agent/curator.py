@@ -1109,6 +1109,15 @@ def _write_run_report(
     )
     consolidated = classification["consolidated"]
     pruned = classification["pruned"]
+    delete_declarations_not_archived: List[Dict[str, Any]] = []
+    for name in sorted(set(absorbed_declarations) - set(removed)):
+        dec = absorbed_declarations.get(name) or {}
+        entry: Dict[str, Any] = {
+            "name": name,
+            "into": dec.get("into", ""),
+            "source": "absorbed_into declaration for non-archived skill",
+        }
+        delete_declarations_not_archived.append(entry)
 
     # Rewrite cron job skill references. When the curator consolidates
     # skill X into umbrella Y, any cron job that lists X fails to load
@@ -1157,6 +1166,7 @@ def _write_run_report(
             "added_this_run": len(added),
             "consolidated_this_run": len(consolidated),
             "pruned_this_run": len(pruned),
+            "delete_declarations_not_archived": len(delete_declarations_not_archived),
             "state_transitions": len(transitions),
             "cron_jobs_rewritten": int(cron_rewrites.get("jobs_updated", 0)),
             "tool_calls_total": sum(tc_counts.values()),
@@ -1166,6 +1176,7 @@ def _write_run_report(
         "consolidated": consolidated,
         "pruned": pruned,
         "pruned_names": [p["name"] for p in pruned],
+        "delete_declarations_not_archived": delete_declarations_not_archived,
         "added": added,
         "state_transitions": transitions,
         "cron_rewrites": cron_rewrites,
@@ -1243,6 +1254,11 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
                  f"(by name: {', '.join(f'{k}={v}' for k, v in sorted(tc_counts.items())) or 'none'})")
     lines.append(f"- consolidated into umbrellas: **{counts.get('consolidated_this_run', 0)}**")
     lines.append(f"- pruned (archived for staleness): **{counts.get('pruned_this_run', 0)}**")
+    if counts.get("delete_declarations_not_archived", 0):
+        lines.append(
+            "- delete declarations not archived this run: "
+            f"**{counts.get('delete_declarations_not_archived', 0)}**"
+        )
     lines.append(f"- new skills this run: **{counts.get('added_this_run', 0)}**")
     lines.append(f"- state transitions (active ↔ stale ↔ archived): "
                  f"**{counts.get('state_transitions', 0)}**")
@@ -1313,6 +1329,32 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
                 lines.append(f"- `{entry}`")
         if len(pruned) > SHOW:
             lines.append(f"- … and {len(pruned) - SHOW} more (see `run.json`)")
+        lines.append("")
+
+    # Delete declarations for skills that were not removed between the active
+    # before/after snapshots. These usually mean the model called delete for a
+    # skill that was already archived or otherwise absent. Preserve the evidence
+    # without counting it as an archive performed in this run.
+    extra_deletes = p.get("delete_declarations_not_archived") or []
+    if extra_deletes:
+        lines.append(
+            f"### Delete declarations not archived this run ({len(extra_deletes)})\n"
+        )
+        lines.append(
+            "_These `skill_manage(delete)` calls declared an `absorbed_into` target, "
+            "but the skill was not present in the active before/after snapshots, "
+            "so it is not counted under archived/consolidated/pruned this run._\n"
+        )
+        SHOW = 50
+        for entry in extra_deletes[:SHOW]:
+            name = entry.get("name", "?")
+            into = entry.get("into", "")
+            if into:
+                lines.append(f"- `{name}` → declared absorbed into `{into}`")
+            else:
+                lines.append(f"- `{name}` → declared prune")
+        if len(extra_deletes) > SHOW:
+            lines.append(f"- … and {len(extra_deletes) - SHOW} more (see `run.json`)")
         lines.append("")
 
     # Added list
