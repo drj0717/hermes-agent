@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
+from utils import atomic_json_write
 from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
@@ -446,7 +447,13 @@ DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        persist_to_global_fallback: bool = False,
+    ):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
@@ -454,6 +461,7 @@ class CredentialPool:
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
+        self._persist_to_global_fallback = persist_to_global_fallback
 
     def has_credentials(self) -> bool:
         return bool(self._entries)
@@ -478,10 +486,11 @@ class CredentialPool:
                 return
 
     def _persist(self) -> None:
-        write_credential_pool(
-            self.provider,
-            [entry.to_dict() for entry in self._entries],
-        )
+        entries = [entry.to_dict() for entry in self._entries]
+        if self._persist_to_global_fallback:
+            _write_global_credential_pool(self.provider, entries)
+            return
+        write_credential_pool(self.provider, entries)
 
     def _is_terminal_auth_failure(
         self,
@@ -2153,8 +2162,49 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
+def _provider_has_local_pool_entries(provider: str) -> bool:
+    auth_store = _load_auth_store()
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        return False
+    entries = pool.get(provider)
+    return isinstance(entries, list) and bool(entries)
+
+
+def _provider_has_global_pool_entries(provider: str) -> bool:
+    global_store = auth_mod._load_global_auth_store()
+    pool = global_store.get("credential_pool") if isinstance(global_store, dict) else None
+    if not isinstance(pool, dict):
+        return False
+    entries = pool.get(provider)
+    return isinstance(entries, list) and bool(entries)
+
+
+def _write_global_credential_pool(provider_id: str, entries: List[Dict[str, Any]]) -> None:
+    global_path = auth_mod._global_auth_file_path()
+    if global_path is None:
+        write_credential_pool(provider_id, entries)
+        return
+    with _auth_store_lock():
+        auth_store = auth_mod._load_auth_store(global_path) if global_path.exists() else {}
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+        pool[provider_id] = [
+            sanitize_borrowed_credential_payload(entry, provider_id)
+            if isinstance(entry, dict) else entry
+            for entry in entries
+        ]
+        atomic_json_write(global_path, auth_store, indent=2)
+
+
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    persist_to_global_fallback = (
+        not _provider_has_local_pool_entries(provider)
+        and _provider_has_global_pool_entries(provider)
+    )
     raw_entries = read_credential_pool(provider)
     raw_needs_sanitization = any(
         isinstance(payload, dict)
@@ -2176,8 +2226,15 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= _normalize_pool_priorities(provider, entries)
 
     if changed:
-        write_credential_pool(
-            provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-        )
-    return CredentialPool(provider, entries)
+        entries_to_persist = [
+            entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)
+        ]
+        if persist_to_global_fallback:
+            _write_global_credential_pool(provider, entries_to_persist)
+        else:
+            write_credential_pool(provider, entries_to_persist)
+    return CredentialPool(
+        provider,
+        entries,
+        persist_to_global_fallback=persist_to_global_fallback,
+    )
